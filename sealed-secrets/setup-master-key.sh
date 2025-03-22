@@ -15,9 +15,9 @@ NC='\033[0m' # No Color
 # Configuration
 AWS_SECRET_NAME="scholar-spark/sealed-secrets/master-key"
 AWS_BACKUP_SECRET_NAME="scholar-spark/sealed-secrets/master-key-backups"
-BACKUP_DIR="./key-backup"
+YAML_DIR="./yaml-keys"
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
-YAML_FILE="${BACKUP_DIR}/sealed-secrets-key-${TIMESTAMP}.yaml"
+YAML_FILE="${YAML_DIR}/sealed-secrets-key-${TIMESTAMP}.yaml"
 
 # Check for required tools
 echo -e "${BLUE}Checking prerequisites...${NC}"
@@ -60,8 +60,8 @@ if [[ -z "${AWS_ACCESS_KEY_ID:-}" || -z "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
   exit 1
 fi
 
-# Create backup directory if it doesn't exist
-mkdir -p "$BACKUP_DIR"
+# Create YAML directory if it doesn't exist
+mkdir -p "$YAML_DIR"
 
 # Display warning and confirmation
 echo -e "${RED}!!! WARNING !!!${NC}"
@@ -100,6 +100,7 @@ if aws secretsmanager describe-secret --secret-id "$AWS_SECRET_NAME" &> /dev/nul
         --secret-id "$AWS_BACKUP_SECRET_NAME" \
         --secret-string "$EXISTING_KEY" \
         --version-stages "AWSCURRENT" "Backup-${TIMESTAMP}"
+      echo -e "${GREEN}Existing key backed up in AWS Secrets Manager with version tag: Backup-${TIMESTAMP}${NC}"
     else
       # Create a new backup secret
       aws secretsmanager create-secret \
@@ -107,18 +108,21 @@ if aws secretsmanager describe-secret --secret-id "$AWS_SECRET_NAME" &> /dev/nul
         --description "Backups of Sealed Secrets master keys for Scholar Spark" \
         --secret-string "$EXISTING_KEY" \
         --tags Key=Environment,Value=Production Key=Application,Value=ScholarSpark
+      echo -e "${GREEN}Backup secret created in AWS Secrets Manager: $AWS_BACKUP_SECRET_NAME${NC}"
     fi
     
-    # Also save a local YAML copy for Kubernetes applications
-    echo "$EXISTING_KEY" | jq -r '.' > "${BACKUP_DIR}/sealed-secrets-key-backup-${TIMESTAMP}.json"
-    
-    # Extract the base64 encoded values from the JSON
-    TLS_CRT=$(echo "$EXISTING_KEY" | jq -r '.data."tls.crt"')
-    TLS_KEY=$(echo "$EXISTING_KEY" | jq -r '.data."tls.key"')
-    SECRET_NAME=$(echo "$EXISTING_KEY" | jq -r '.metadata.name')
-    
-    # Create the YAML file
-    cat > "${BACKUP_DIR}/sealed-secrets-key-backup-${TIMESTAMP}.yaml" <<EOF
+    # Create YAML file for Kubernetes applications if needed
+    read -p "Do you want to create a YAML version of the existing key for Kubernetes? (y/N) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      # Extract the base64 encoded values from the JSON
+      TLS_CRT=$(echo "$EXISTING_KEY" | jq -r '.data."tls.crt"')
+      TLS_KEY=$(echo "$EXISTING_KEY" | jq -r '.data."tls.key"')
+      SECRET_NAME=$(echo "$EXISTING_KEY" | jq -r '.metadata.name')
+      
+      # Create the YAML file
+      EXISTING_YAML="${YAML_DIR}/sealed-secrets-key-backup-${TIMESTAMP}.yaml"
+      cat > "$EXISTING_YAML" <<EOF
 apiVersion: v1
 kind: Secret
 metadata:
@@ -129,9 +133,8 @@ data:
   tls.key: ${TLS_KEY}
 type: kubernetes.io/tls
 EOF
-    
-    echo -e "${GREEN}Existing key backed up in AWS Secrets Manager with version tag: Backup-${TIMESTAMP}${NC}"
-    echo -e "${GREEN}Local YAML backup created at: ${BACKUP_DIR}/sealed-secrets-key-backup-${TIMESTAMP}.yaml${NC}"
+      echo -e "${GREEN}YAML version of existing key created at: $EXISTING_YAML${NC}"
+    fi
   fi
   
   read -p "Do you want to continue and overwrite the existing key? (y/N) " -n 1 -r
@@ -232,6 +235,6 @@ echo -e "${GREEN}Backup stored in AWS Secrets Manager: $AWS_BACKUP_SECRET_NAME (
 echo -e "${GREEN}YAML version created at: $YAML_FILE${NC}"
 echo -e "${YELLOW}Important: Distribute the YAML key file to developers who need to update their sealed-secrets-controller.${NC}"
 echo -e "${BLUE}Next steps:${NC}"
-echo -e "1. Run ./backup-master-key.sh to create additional backups"
-echo -e "2. Store backups in secure locations according to security policy"
-echo -e "3. Distribute the YAML key file to developers"
+echo -e "1. Store the YAML key file in a secure location"
+echo -e "2. Distribute the YAML key file to developers who need to update their sealed-secrets-controller"
+echo -e "3. Delete the YAML key file after distribution if not needed for future use"
