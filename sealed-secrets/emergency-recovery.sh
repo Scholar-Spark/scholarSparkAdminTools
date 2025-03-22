@@ -14,13 +14,17 @@ NC='\033[0m' # No Color
 
 # Configuration
 AWS_SECRET_NAME="scholar-spark/sealed-secrets/master-key"
+AWS_BACKUP_SECRET_NAME="scholar-spark/sealed-secrets/master-key-backups"
 BACKUP_DIR="./key-backup"
 TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 RECOVERY_LOG="${BACKUP_DIR}/recovery-log.txt"
+BACKUP_TAG="Recovery-${TIMESTAMP}"
 
 # Default values
 KEY_FILE=""
 FROM_S3=false
+FROM_AWS_BACKUP=false
+AWS_VERSION_ID=""
 AWS_BACKUP_BUCKET="scholar-spark-key-backups"
 AWS_BACKUP_PREFIX="sealed-secrets-keys"
 S3_KEY=""
@@ -40,13 +44,23 @@ while [[ $# -gt 0 ]]; do
       S3_KEY="$2"
       shift 2
       ;;
+    --from-aws-backup)
+      FROM_AWS_BACKUP=true
+      shift
+      ;;
+    --aws-version-id)
+      AWS_VERSION_ID="$2"
+      shift 2
+      ;;
     --help)
       echo "Usage: $0 [OPTIONS]"
       echo "Options:"
-      echo "  --key-file FILE    Path to the backup key file (JSON format)"
-      echo "  --from-s3          Recover key from AWS S3"
-      echo "  --s3-key KEY       S3 key for the backup file (required with --from-s3)"
-      echo "  --help             Show this help message"
+      echo "  --key-file FILE       Path to the backup key file (JSON format)"
+      echo "  --from-s3             Recover key from AWS S3"
+      echo "  --s3-key KEY          S3 key for the backup file (required with --from-s3)"
+      echo "  --from-aws-backup     Recover key from AWS Secrets Manager backup"
+      echo "  --aws-version-id ID   Version ID or stage name for AWS backup (required with --from-aws-backup)"
+      echo "  --help                Show this help message"
       exit 0
       ;;
     *)
@@ -65,14 +79,36 @@ for cmd in aws jq; do
   fi
 done
 
-# Check AWS CLI if needed
-if [[ "$FROM_S3" == true ]]; then
-  # Check for AWS credentials
-  if [[ -z "${AWS_ACCESS_KEY_ID:-}" || -z "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
-    echo -e "${RED}Error: AWS credentials not found in environment.${NC}"
-    echo -e "Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables."
-    exit 1
+# Check for AWS credentials - use AWS CLI config if available
+if [[ -z "${AWS_ACCESS_KEY_ID:-}" ]]; then
+  AWS_ACCESS_KEY_ID=$(aws configure get aws_access_key_id 2>/dev/null || echo "")
+  if [[ -n "$AWS_ACCESS_KEY_ID" ]]; then
+    echo -e "${BLUE}Using AWS access key from AWS CLI configuration.${NC}"
+    export AWS_ACCESS_KEY_ID
   fi
+fi
+
+if [[ -z "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
+  AWS_SECRET_ACCESS_KEY=$(aws configure get aws_secret_access_key 2>/dev/null || echo "")
+  if [[ -n "$AWS_SECRET_ACCESS_KEY" ]]; then
+    echo -e "${BLUE}Using AWS secret key from AWS CLI configuration.${NC}"
+    export AWS_SECRET_ACCESS_KEY
+  fi
+fi
+
+if [[ -z "${AWS_REGION:-}" && -z "${AWS_DEFAULT_REGION:-}" ]]; then
+  AWS_REGION=$(aws configure get region 2>/dev/null || echo "")
+  if [[ -n "$AWS_REGION" ]]; then
+    echo -e "${BLUE}Using AWS region from AWS CLI configuration: $AWS_REGION${NC}"
+    export AWS_REGION
+  fi
+fi
+
+# Final check for AWS credentials
+if [[ -z "${AWS_ACCESS_KEY_ID:-}" || -z "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
+  echo -e "${RED}Error: AWS credentials not found in environment or AWS CLI configuration.${NC}"
+  echo -e "Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables or configure AWS CLI."
+  exit 1
 fi
 
 # Create backup directory if it doesn't exist
@@ -107,7 +143,42 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
 fi
 
 # Determine the source of the backup key
-if [[ "$FROM_S3" == true ]]; then
+if [[ "$FROM_AWS_BACKUP" == true ]]; then
+  if [[ -z "$AWS_VERSION_ID" ]]; then
+    echo -e "${RED}Error: --aws-version-id is required with --from-aws-backup.${NC}"
+    exit 1
+  fi
+  
+  echo -e "${BLUE}Retrieving key from AWS Secrets Manager backup...${NC}"
+  if ! aws secretsmanager describe-secret --secret-id "$AWS_BACKUP_SECRET_NAME" &> /dev/null; then
+    echo -e "${RED}Error: Backup secret not found in AWS Secrets Manager.${NC}"
+    exit 1
+  fi
+  
+  # List available versions to help the user
+  echo -e "${BLUE}Available backup versions:${NC}"
+  aws secretsmanager list-secret-version-ids --secret-id "$AWS_BACKUP_SECRET_NAME" --query "Versions[*].[VersionId,VersionStages]" --output table
+  
+  # Get the secret value for the specified version
+  TMPDIR=$(mktemp -d)
+  KEY_FILE="${TMPDIR}/aws-backup-key.json"
+  
+  if [[ "$AWS_VERSION_ID" == *"-"* ]]; then
+    # Assume it's a version stage name
+    aws secretsmanager get-secret-value --secret-id "$AWS_BACKUP_SECRET_NAME" --version-stage "$AWS_VERSION_ID" --query SecretString --output text > "$KEY_FILE"
+  else
+    # Assume it's a version ID
+    aws secretsmanager get-secret-value --secret-id "$AWS_BACKUP_SECRET_NAME" --version-id "$AWS_VERSION_ID" --query SecretString --output text > "$KEY_FILE"
+  fi
+  
+  if [[ ! -s "$KEY_FILE" ]]; then
+    echo -e "${RED}Error: Failed to retrieve key from AWS Secrets Manager backup.${NC}"
+    rm -rf "$TMPDIR"
+    exit 1
+  fi
+  
+  echo -e "${GREEN}Key retrieved from AWS Secrets Manager backup.${NC}"
+elif [[ "$FROM_S3" == true ]]; then
   if [[ -z "$S3_KEY" ]]; then
     echo -e "${RED}Error: --s3-key is required with --from-s3.${NC}"
     exit 1
@@ -126,7 +197,7 @@ if [[ "$FROM_S3" == true ]]; then
   echo -e "${GREEN}Key retrieved from AWS S3.${NC}"
 elif [[ -z "$KEY_FILE" ]]; then
   echo -e "${RED}Error: No key source specified.${NC}"
-  echo -e "Please specify one of: --key-file or --from-s3."
+  echo -e "Please specify one of: --key-file, --from-aws-backup, or --from-s3."
   exit 1
 elif [[ ! -f "$KEY_FILE" ]]; then
   echo -e "${RED}Error: Key file not found: $KEY_FILE${NC}"
@@ -144,7 +215,27 @@ fi
 CURRENT_BACKUP="${BACKUP_DIR}/sealed-secrets-key-before-recovery-${TIMESTAMP}.json"
 if aws secretsmanager describe-secret --secret-id "$AWS_SECRET_NAME" &> /dev/null; then
   echo -e "${BLUE}Backing up current master key from AWS...${NC}"
-  aws secretsmanager get-secret-value --secret-id "$AWS_SECRET_NAME" --query SecretString --output text > "$CURRENT_BACKUP"
+  CURRENT_KEY=$(aws secretsmanager get-secret-value --secret-id "$AWS_SECRET_NAME" --query SecretString --output text)
+  echo "$CURRENT_KEY" > "$CURRENT_BACKUP"
+  
+  # Store the backup in AWS Secrets Manager with timestamp
+  if aws secretsmanager describe-secret --secret-id "$AWS_BACKUP_SECRET_NAME" &> /dev/null; then
+    # Update existing backup secret with a new version
+    aws secretsmanager put-secret-value \
+      --secret-id "$AWS_BACKUP_SECRET_NAME" \
+      --secret-string "$CURRENT_KEY" \
+      --version-stages "AWSCURRENT" "$BACKUP_TAG"
+    echo -e "${GREEN}Current key backed up in AWS Secrets Manager with version tag: $BACKUP_TAG${NC}"
+  else
+    # Create a new backup secret
+    aws secretsmanager create-secret \
+      --name "$AWS_BACKUP_SECRET_NAME" \
+      --description "Backups of Sealed Secrets master keys for Scholar Spark" \
+      --secret-string "$CURRENT_KEY" \
+      --tags Key=Environment,Value=Production Key=Application,Value=ScholarSpark
+    echo -e "${GREEN}Backup secret created in AWS Secrets Manager: $AWS_BACKUP_SECRET_NAME${NC}"
+  fi
+  
   echo -e "${GREEN}Current key backed up to $CURRENT_BACKUP${NC}"
 fi
 
@@ -200,10 +291,16 @@ echo "Emergency recovery performed on $(date)" >> "$RECOVERY_LOG"
 echo "Restored from: $KEY_FILE" >> "$RECOVERY_LOG"
 if [[ -n "${CURRENT_BACKUP:-}" && -f "${CURRENT_BACKUP:-}" ]]; then
   echo "Previous key backed up to: $CURRENT_BACKUP" >> "$RECOVERY_LOG"
+  echo "Previous key backed up to AWS Secrets Manager with version tag: $BACKUP_TAG" >> "$RECOVERY_LOG"
 fi
 echo "YAML version created at: $YAML_FILE" >> "$RECOVERY_LOG"
 
 echo -e "${GREEN}Emergency recovery complete!${NC}"
+echo -e "${GREEN}Key restored to AWS Secrets Manager: $AWS_SECRET_NAME${NC}"
+if [[ -n "${CURRENT_BACKUP:-}" && -f "${CURRENT_BACKUP:-}" ]]; then
+  echo -e "${GREEN}Previous key backed up in AWS Secrets Manager: $AWS_BACKUP_SECRET_NAME (version: $BACKUP_TAG)${NC}"
+fi
+echo -e "${GREEN}YAML version created at: $YAML_FILE${NC}"
 echo -e "${YELLOW}Important: Distribute the YAML key file to all developers who need to update their sealed-secrets-controller.${NC}"
 echo -e "${BLUE}Next steps:${NC}"
 echo -e "1. Run ./backup-master-key.sh to create additional backups of the restored key"

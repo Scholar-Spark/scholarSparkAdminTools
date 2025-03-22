@@ -10,8 +10,15 @@
 
 2. Ensure you have AWS credentials with appropriate permissions:
    ```bash
-   export AWS_ACCESS_KEY_ID=your_admin_key
-   export AWS_SECRET_ACCESS_KEY=your_admin_secret
+   # The scripts will automatically use your AWS CLI configuration if available
+   # To verify your current AWS credentials:
+   aws configure get aws_access_key_id
+   aws configure get aws_secret_access_key
+   aws configure get region
+   
+   # If you need to use different credentials for this operation:
+   export AWS_ACCESS_KEY_ID=$(aws configure get aws_access_key_id)
+   export AWS_SECRET_ACCESS_KEY=$(aws configure get aws_secret_access_key)
    ```
 
 3. Run the setup script:
